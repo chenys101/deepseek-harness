@@ -169,6 +169,8 @@ kind: "package-reference"
 - **仅光栅提示词图片**——PNG、JPEG、WebP 与 GIF 要求持久附件存储及确切的图片能力路由。
 - **仅 MCP 工具**——MCP resource 与 prompt 没有 DSH 消费方。
 - **没有 transcript 回放或交互式扩展**——会话删除、fork、`session/load`、mode、命令、计划、终端、客户端文件系统操作与 elicitation 仍不属于此自动化界面。
+- **本 fork 中 `configOptions` 恒为空**——`[pieqi-fork]` 对通用客户端隐藏模型清单，改由 `session/new`、`session/resume` 响应 `_meta` 的 `pieqi/configOptions` 键回传，并让 `topologyChanged()` 不再推送 `config_option_update`。不读该键的客户端看不到模型选择器。详见 [FORK.md](FORK.md)。
+- **`provider`／`model` 为空时回落到部署默认模型**——`[pieqi-fork]` 对不完整的静态 ACP 选路改走可选的 `agentDefaultModel` 服务，不再让会话没有路由。两个服务都不挂载的部署保持上游行为。详见 [FORK.md](FORK.md)。
 
 <a id="dev-note"></a>
 ### 开发备注

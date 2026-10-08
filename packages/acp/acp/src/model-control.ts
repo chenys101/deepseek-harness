@@ -235,3 +235,19 @@ export class AcpModelControl {
 function modelValue(provider: string, model: string): SessionConfigValueId {
   return JSON.stringify([provider, model])
 }
+
+/**
+ * [pieqi-fork] Opaque ACP selector value for a route arriving outside the option catalog.
+ * @param provider - provider route.
+ * @param model - provider-owned model id.
+ * @returns the selector value `setConfig` accepts for the `model` option.
+ */
+export function modelConfigValue(provider: string, model: string): SessionConfigValueId {
+  return modelValue(provider, model)
+}
+
+/**
+ * [pieqi-fork] Id of the model option in the standard configuration state.
+ * @returns the opaque config id carried by the model option.
+ */
+export const MODEL_OPTION_ID = MODEL_CONFIG_ID

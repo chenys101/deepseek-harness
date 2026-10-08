@@ -169,6 +169,8 @@ These limits define when this package is a poor fit or needs special operational
 - **Raster prompt images only** — PNG, JPEG, WebP, and GIF require a durable attachment store and an exact image-capable route.
 - **MCP tools only** — MCP resources and prompts have no DSH consumer.
 - **No transcript replay or interactive extensions** — session deletion, fork, `session/load`, modes, commands, plans, terminals, client filesystem operations, and elicitation remain outside this automation surface.
+- **`configOptions` stays empty in this fork** — `[pieqi-fork]` hides the model catalog from general clients and relays it through `session/new` and `session/resume` response `_meta` under `pieqi/configOptions`, and `topologyChanged()` stops emitting `config_option_update`. A client that does not read that key never sees a model selector. See [FORK.md](FORK.md).
+- **Empty `provider`/`model` fall back to the deployment default** — `[pieqi-fork]` resolves an incomplete static ACP selection through the optional `agentDefaultModel` service instead of leaving the session without a route. A deployment that mounts neither keeps the upstream behavior. See [FORK.md](FORK.md).
 
 <a id="dev-note"></a>
 ### Dev Note

@@ -10,7 +10,7 @@ import { SESSION_FORMAT_VERSION, SessionId } from '@deepseek-ai/dsh-session'
 import type { SessionHeader } from '@deepseek-ai/dsh-session'
 import { SessionPersistenceRevision, type SessionPersistenceSnapshot } from '@deepseek-ai/dsh-session-persistence'
 import { defineContentToolFixture } from '@deepseek-ai/dsh-tools'
-import { makeBridgeHarness, textResponse, type BridgeHarness } from './harness.ts'
+import { configOption, makeBridgeHarness, relayedConfigOptions, textResponse, type BridgeHarness } from './harness.ts'
 import { startHttpMcpFixture } from '../../../mcp/mcp-client/tests/http-fixture.ts'
 
 /** Wrap a bare header as the snapshot shape `SessionPersistence.list` now returns. */
@@ -309,7 +309,8 @@ describe('automation-only ACP bridge', () => {
 
     const resumed = await harness.client.resumeSession({ sessionId: created.sessionId, cwd: process.cwd() })
 
-    expect(resumed.configOptions?.find(option => option.id === 'model')).toMatchObject({
+    expect(resumed.configOptions).toEqual([])
+    expect(configOption(relayedConfigOptions(resumed), 'model')).toMatchObject({
       currentValue: '["mock","mock"]',
     })
   })
@@ -328,7 +329,7 @@ describe('automation-only ACP bridge', () => {
 
     const resumed = await harness.client.resumeSession({ sessionId: created.sessionId, cwd: process.cwd() })
 
-    expect(resumed.configOptions?.find(option => option.id === 'reasoning_effort')).toMatchObject({
+    expect(configOption(relayedConfigOptions(resumed), 'reasoning_effort')).toMatchObject({
       currentValue: 'low',
     })
   })
@@ -462,7 +463,7 @@ describe('automation-only ACP bridge', () => {
       .rejects.toThrow(/Internal error/)
 
     const created = await harness.client.newSession({ cwd: process.cwd(), mcpServers: [] })
-    const model = created.configOptions?.find(option => option.id === 'model')
+    const model = configOption(relayedConfigOptions(created), 'model')
     if (model?.type !== 'select') throw new Error('expected model options')
     const plain = model.options.flatMap(option => 'group' in option ? option.options : [option])
       .find(option => option.name === 'Mock Plain')
@@ -513,7 +514,7 @@ describe('automation-only ACP bridge', () => {
     harness = await makeBridgeHarness({ script: [textResponse('plain answer')] })
     await harness.client.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} })
     const created = await harness.client.newSession({ cwd: process.cwd(), mcpServers: [] })
-    const model = created.configOptions?.find(option => option.id === 'model')
+    const model = configOption(relayedConfigOptions(created), 'model')
     if (model?.type !== 'select') throw new Error('expected a model select option')
     const choices = model.options.flatMap(option => 'group' in option ? option.options : [option])
     const plain = choices.find(option => option.name === 'Mock Plain')
@@ -524,28 +525,24 @@ describe('automation-only ACP bridge', () => {
       configId: 'model',
       value: plain.value,
     })
-    expect(selected.configOptions.find(option => option.id === 'reasoning_effort')).toBeUndefined()
+    expect(configOption(selected.configOptions, 'reasoning_effort')).toBeUndefined()
     await harness.client.prompt({ sessionId: created.sessionId, prompt: [{ type: 'text', text: 'use plain' }] })
 
     expect(harness.adapter.requests[0]).toMatchObject({ provider: 'mock', model: 'plain' })
   })
 
-  it('publishes complete config options when adapter topology changes', async () => {
+  it('folds a new adapter topology into the catalog without pushing an update', async () => {
     harness = await makeBridgeHarness()
     await harness.client.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} })
-    const created = await harness.client.newSession({ cwd: process.cwd(), mcpServers: [] })
+    await harness.client.newSession({ cwd: process.cwd(), mcpServers: [] })
 
     harness.registerCatalogProvider('other')
-
     await vi.waitFor(() => {
-      const update = harness!.updates.find(item => item.sessionUpdate === 'config_option_update')
-      expect(update).toBeDefined()
-      if (update?.sessionUpdate !== 'config_option_update') return
-      const model = update.configOptions.find(option => option.id === 'model')
-      if (model?.type !== 'select') throw new Error('expected a model select option')
-      expect(model.options.some(option => 'group' in option && option.group === 'other')).toBe(true)
+      expect(harness!.ctx.llm.listProviders().map(provider => provider.id)).toContain('other')
     })
-    expect(harness.sessionUpdates.at(-1)?.sessionId).toBe(created.sessionId)
+
+    // A2: a topology change alters the next explicit read, never a pushed update.
+    expect(harness.updates.some(update => update.sessionUpdate === 'config_option_update')).toBe(false)
   })
 
   it('does not let hung topology discovery block prompt completion or close', async () => {
@@ -554,13 +551,12 @@ describe('automation-only ACP bridge', () => {
     const created = await harness.client.newSession({ cwd: process.cwd(), mcpServers: [] })
     const original = harness.ctx.llm.listModels.bind(harness.ctx.llm)
     const blocked = Promise.withResolvers<Awaited<ReturnType<typeof original>>>()
-    const listModels = vi.spyOn(harness.ctx.llm, 'listModels').mockImplementation((provider: string) => (
+    vi.spyOn(harness.ctx.llm, 'listModels').mockImplementation((provider: string) => (
       provider === 'hung' ? blocked.promise : original(provider)
     ))
 
     try {
       harness.registerCatalogProvider('hung')
-      await vi.waitFor(() => { expect(listModels).toHaveBeenCalledWith('hung') })
       await expect(harness.client.prompt({
         sessionId: created.sessionId,
         prompt: [{ type: 'text', text: 'continue while discovery is pending' }],
@@ -568,41 +564,30 @@ describe('automation-only ACP bridge', () => {
       await expect(harness.client.closeSession({ sessionId: created.sessionId })).resolves.toEqual({})
     } finally {
       blocked.resolve([])
-      listModels.mockRestore()
     }
   })
 
-  it('publishes recoverable options when the selected adapter disappears', async () => {
+  it('keeps the selected route while its adapter disappears from the catalog', async () => {
     harness = await makeBridgeHarness()
     await harness.client.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} })
     const created = await harness.client.newSession({ cwd: process.cwd(), mcpServers: [] })
     harness.registerCatalogProvider('other')
-    await vi.waitFor(() => {
-      expect(harness!.updates.some(update => update.sessionUpdate === 'config_option_update')).toBe(true)
-    })
-
     harness.replacePrimaryProviders([])
     expect(harness.ctx.llm.listProviders().map(provider => provider.id)).toEqual(['other'])
 
-    await vi.waitFor(() => {
-      const configUpdates = harness!.updates.filter(item => item.sessionUpdate === 'config_option_update')
-      expect(configUpdates).toHaveLength(2)
-      const update = configUpdates.at(-1)
-      if (update?.sessionUpdate !== 'config_option_update') throw new Error('expected config update')
-      const model = update.configOptions.find(option => option.id === 'model')
-      if (model?.type !== 'select') throw new Error('expected model options')
-      const groups = model.options.filter(option => 'group' in option)
-      expect(groups.map(group => group.group)).toEqual(['other', 'mock'])
-      expect(model.currentValue).toBe('["mock","mock"]')
-    })
-    expect(harness.sessionUpdates.at(-1)?.sessionId).toBe(created.sessionId)
+    // A2 stops the notification, so the recovered catalog is observable on the
+    // next explicit read: the selected route is retained as its own group.
+    const model = configOption(relayedConfigOptions(created), 'model')
+    if (model?.type !== 'select') throw new Error('expected a model select option')
+    expect(model.currentValue).toBe('["mock","mock"]')
+    expect(harness.updates.some(update => update.sessionUpdate === 'config_option_update')).toBe(false)
   })
 
   it('selects an advertised reasoning effort for the next turn', async () => {
     harness = await makeBridgeHarness({ script: [textResponse('reasoned')] })
     await harness.client.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} })
     const created = await harness.client.newSession({ cwd: process.cwd(), mcpServers: [] })
-    const reasoning = created.configOptions?.find(option => option.id === 'reasoning_effort')
+    const reasoning = configOption(relayedConfigOptions(created), 'reasoning_effort')
     if (reasoning?.type !== 'select') throw new Error('expected a reasoning select option')
     const low = reasoning.options.find(option => !('group' in option) && option.name === 'Low')
     if (low === undefined || 'group' in low) throw new Error('expected Low reasoning effort')
@@ -641,8 +626,8 @@ describe('automation-only ACP bridge', () => {
     harness = await makeBridgeHarness({ script: [textResponse('plain')] })
     await harness.client.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} })
     const created = await harness.client.newSession({ cwd: process.cwd(), mcpServers: [] })
-    const model = created.configOptions?.find(option => option.id === 'model')
-    const reasoning = created.configOptions?.find(option => option.id === 'reasoning_effort')
+    const model = configOption(relayedConfigOptions(created), 'model')
+    const reasoning = configOption(relayedConfigOptions(created), 'reasoning_effort')
     if (model?.type !== 'select' || reasoning?.type !== 'select') throw new Error('expected model and reasoning options')
     const plain = model.options.flatMap(option => 'group' in option ? option.options : [option])
       .find(option => option.name === 'Mock Plain')
@@ -671,7 +656,7 @@ describe('automation-only ACP bridge', () => {
     harness = await makeBridgeHarness({ imageCapable: true, script: [textResponse('image accepted')] })
     await harness.client.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} })
     const created = await harness.client.newSession({ cwd: process.cwd(), mcpServers: [] })
-    const model = created.configOptions?.find(option => option.id === 'model')
+    const model = configOption(relayedConfigOptions(created), 'model')
     if (model?.type !== 'select') throw new Error('expected a model option')
     const plain = model.options.flatMap(option => 'group' in option ? option.options : [option])
       .find(option => option.name === 'Mock Plain')
@@ -708,7 +693,7 @@ describe('automation-only ACP bridge', () => {
     harness = await makeBridgeHarness({ script: [oneToolCall(), textResponse('first turn'), textResponse('second turn')] })
     await harness.client.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} })
     const created = await harness.client.newSession({ cwd: process.cwd(), mcpServers: [] })
-    const model = created.configOptions?.find(option => option.id === 'model')
+    const model = configOption(relayedConfigOptions(created), 'model')
     if (model?.type !== 'select') throw new Error('expected a model select option')
     const choices = model.options.flatMap(option => 'group' in option ? option.options : [option])
     const plain = choices.find(option => option.name === 'Mock Plain')

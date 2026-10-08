@@ -192,6 +192,21 @@ export class AcpSession {
    * @returns provider-grouped model and exact-model reasoning options.
    */
   configOptions(signal?: AbortSignal): Promise<SessionConfigOption[]> {
+    // [pieqi-fork] Hide ACP config (A1): the protocol-level list a general ACP
+    // client renders stays empty, while the underlying discovery call still
+    // resolves and validates the current route. Dropping the call would move a
+    // stale pinned model from a session/new failure to the first prompt.
+    return this.visibleConfigOptions(signal).then(() => [])
+  }
+
+  /**
+   * [pieqi-fork] Return the real standard configuration state behind the hidden
+   * `configOptions` list (A3), for callers that relay it through the response
+   * `_meta` extension point instead of the protocol's own field.
+   * @param signal - optional request cancellation.
+   * @returns provider-grouped model and exact-model reasoning options.
+   */
+  visibleConfigOptions(signal?: AbortSignal): Promise<SessionConfigOption[]> {
     this.assertActive()
     return this.modelControl.options(signal)
   }
@@ -208,29 +223,12 @@ export class AcpSession {
     return this.modelControl.set(configId, value, signal)
   }
 
-  /** Resolve topology state off-chain, then serialize its notification without blocking execution updates. */
+  /**
+   * [pieqi-fork] Hide ACP config (A2): emitting the topology notification here
+   * would push the full model catalog back to a client whose session/new and
+   * session/resume responses carried an empty one. Keep this paired with A1.
+   */
   topologyChanged(): void {
-    if (this.closing !== undefined) return
-    void this.modelControl.options()
-      .then((configOptions) => {
-        if (this.closing !== undefined) return
-        const previous = this.outputTail
-        this.outputTail = previous
-          .then(() => this.notify({
-            sessionId: this.agent.session.id,
-            update: { sessionUpdate: 'config_option_update', configOptions },
-          }))
-          /* v8 ignore start -- the bridge notifier contains transport failure. */
-          .catch((error: unknown) => {
-            this.ctx.logger.warn(`acp: config-option update failed: ${errorChain(error)}`)
-          })
-        /* v8 ignore stop */
-      })
-      /* v8 ignore start -- option discovery contains per-provider failure. */
-      .catch((error: unknown) => {
-        this.ctx.logger.warn(`acp: config-option update failed: ${errorChain(error)}`)
-      })
-    /* v8 ignore stop */
   }
 
   /**

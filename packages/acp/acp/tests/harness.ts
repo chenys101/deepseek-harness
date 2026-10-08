@@ -15,6 +15,7 @@ import {
   type RequestPermissionRequest,
   type RequestPermissionResponse,
   type SendRequestOptions,
+  type SessionConfigOption,
   type SessionNotification,
   type Stream,
 } from '@agentclientprotocol/sdk'
@@ -180,6 +181,34 @@ export function errorResponse(message: string): StreamChunk[] {
 }
 
 export type CapturedUpdate = SessionNotification['update']
+
+/**
+ * [pieqi-fork] Read the configuration catalog a session response carries.
+ *
+ * A1 hides it from the protocol's own `configOptions` field, so the real state
+ * arrives in response `_meta` under `pieqi/configOptions` (A3). Tests assert
+ * both halves: the empty protocol field and the relayed catalog.
+ * @param response - a session/new or session/resume response.
+ * @returns the relayed catalog, or undefined when none was advertised.
+ */
+export function relayedConfigOptions(
+  response: { _meta?: Record<string, unknown> | null },
+): SessionConfigOption[] | undefined {
+  return response._meta?.['pieqi/configOptions'] as SessionConfigOption[] | undefined
+}
+
+/**
+ * [pieqi-fork] Find one entry in a session's relayed or returned catalog.
+ * @param options - catalog to search, possibly undefined.
+ * @param id - standard configuration option id.
+ * @returns the matching option, or undefined.
+ */
+export function configOption(
+  options: readonly SessionConfigOption[] | undefined,
+  id: string,
+): SessionConfigOption | undefined {
+  return options?.find(option => option.id === id)
+}
 
 /** Stable-v1 client methods exercised by the bridge tests. */
 interface BridgeClient {

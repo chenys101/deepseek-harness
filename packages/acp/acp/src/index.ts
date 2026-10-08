@@ -17,7 +17,7 @@ import { isAbsolute, resolve } from 'node:path'
 import { Readable, Writable } from 'node:stream'
 import Schema from '@deepseek-ai/schemastery'
 import { brandString } from '@deepseek-ai/dsh-brand'
-import { errorChain } from '@deepseek-ai/dsh-llm'
+import { errorChain, ReasoningEffortId } from '@deepseek-ai/dsh-llm'
 import {
   agent as createAcpAgentApp,
   methods,
@@ -40,6 +40,7 @@ import {
   type RequestPermissionRequest,
   type ResumeSessionRequest,
   type ResumeSessionResponse,
+  type SessionConfigOption,
   type SetSessionConfigOptionRequest,
   type SetSessionConfigOptionResponse,
   type SessionNotification,
@@ -50,12 +51,20 @@ import type { SessionId } from '@deepseek-ai/dsh-session'
 import type {} from '@deepseek-ai/dsh-session-persistence'
 // Side-effect type import: declaration-merges the approval waterfall answered below.
 import type {} from '@deepseek-ai/dsh-user-approval'
+// Side-effect type import: declaration-merges the optional default-model
+// service that `deploymentSelection` reads strictly. dsh-acp deliberately does
+// not depend on that package, so a deployment without it must still load.
+import type {} from '@deepseek-ai/dsh-agent-default-model'
 import { supportsAcpImagePrompts } from './content.ts'
 import { AcpMcpConfigError } from './mcp.ts'
-import { AcpModelConfigError } from './model-control.ts'
+import { AcpModelConfigError, MODEL_OPTION_ID, modelConfigValue } from './model-control.ts'
 import { AcpSession } from './session.ts'
 
 const DEFAULT_SESSION_LIST_PAGE_SIZE = 100
+
+// [pieqi-fork] Response `_meta` key carrying the real ACP configuration state
+// that `configOptions` no longer exposes to general clients (A3).
+const CONFIG_OPTIONS_META_KEY = 'pieqi/configOptions'
 
 export const name = 'acp'
 /** Core services required by the standard automation controls. */
@@ -208,7 +217,9 @@ export function apply(ctx: Context, config: AcpConfig): void {
           cwd: params.cwd,
           mcpServers: params.mcpServers,
           agentOptions: agentOptions(config),
-          fallbackSelection: initialSelection(config),
+          // [pieqi-fork] A caller-supplied route (B2) wins over the deployment
+          // route, which itself falls back to the deployment default (B1).
+          fallbackSelection: requestSelection(params._meta) ?? deploymentSelection(ctx, config),
           signal,
           notify,
         })
@@ -223,12 +234,14 @@ export function apply(ctx: Context, config: AcpConfig): void {
       }
       sessions.set(sessionId, record)
       try {
-        const configOptions = await record.configOptions(signal)
+        // [pieqi-fork] The real catalog moves to the response `_meta` (A3) and
+        // the protocol `configOptions` stays empty (A1).
+        const catalog = await record.visibleConfigOptions(signal)
         assertOpen()
         // The attached log writer's flush materializes an empty session durably.
         await ctx.sessions.flush(record.agent.session)
         assertOpen()
-        return { sessionId, configOptions }
+        return { sessionId, configOptions: [], ...catalogMeta(catalog) }
       } catch (error: unknown) {
         sessions.delete(sessionId)
         await record.close('session/new activation failed')
@@ -259,7 +272,10 @@ export function apply(ctx: Context, config: AcpConfig): void {
             cwd: params.cwd,
             mcpServers: params.mcpServers ?? [],
             agentOptions: agentOptions(config),
-            fallbackSelection: initialSelection(config),
+            // [pieqi-fork] Same as session/new (B1/B2). AcpSession.resume prefers
+            // the route recorded in the restored log, so this value only applies
+            // to a persisted session that never logged one.
+            fallbackSelection: requestSelection(params._meta) ?? deploymentSelection(ctx, config),
             signal,
             notify,
           })
@@ -280,7 +296,8 @@ export function apply(ctx: Context, config: AcpConfig): void {
         }
         sessions.set(sessionId, record)
         try {
-          return { configOptions: await record.configOptions(signal) }
+          // [pieqi-fork] Same as session/new: the real catalog travels in `_meta` (A3).
+          return { configOptions: [], ...catalogMeta(await record.visibleConfigOptions(signal)) }
         } catch (error: unknown) {
           sessions.delete(sessionId)
           await record.close('session/resume option discovery failed')
@@ -361,6 +378,19 @@ export function apply(ctx: Context, config: AcpConfig): void {
     async prompt(params: PromptRequest, requestSignal: AbortSignal): Promise<PromptResponse> {
       assertOpen()
       const record = requireSession(brandString<SessionId>(params.sessionId))
+      // [pieqi-fork] Per-turn model (B3): a route named in the request `_meta`
+      // is applied before this turn runs. AcpSession.prompt snapshots the
+      // selection at its own entry, so applying it here binds exactly this
+      // turn. The value has to be the opaque string the catalog handed out.
+      const selection = requestSelection(params._meta)
+      if (selection !== undefined) {
+        try {
+          await record.setConfig(MODEL_OPTION_ID, modelConfigValue(selection.provider, selection.model), requestSignal)
+        } catch (error: unknown) {
+          if (error instanceof AcpModelConfigError) throw invalidParams(error.message)
+          throw error
+        }
+      }
       return record.prompt(params, imagePromptEnabled, requestSignal)
     },
 
@@ -448,11 +478,88 @@ function agentOptions(config: AcpConfig): { provider?: string; model?: string } 
   }
 }
 
-/** Initial session selection when both deployment fields are present. */
-function initialSelection(config: AcpConfig): ModelSelection | undefined {
-  return config.provider === undefined || config.model === undefined
-    ? undefined
-    : { provider: config.provider, model: config.model }
+/** ACP extension metadata carried by a request. */
+type RequestMeta = PromptRequest['_meta']
+
+/**
+ * [pieqi-fork] Deployment route for a new session (B1): the static ACP
+ * provider/model pair when both are configured, otherwise the deployment
+ * default model.
+ *
+ * Upstream yields a route only when both config fields are present, leaving
+ * `AcpModelControl.selected` undefined otherwise: `configOptions` stays empty
+ * and `session/set_config_option` answers "this session has no model
+ * selection", so the session is unusable. A deployment that stops pinning a
+ * model, or whose pinned model is retired, should still run on its default.
+ * @param ctx - ACP plugin context carrying the optional default-model service.
+ * @param config - ACP provider/model configuration.
+ * @returns the initial route, or undefined when neither source supplies one.
+ */
+function deploymentSelection(ctx: Context, config: AcpConfig): ModelSelection | undefined {
+  if (config.provider !== undefined && config.model !== undefined) {
+    return { provider: config.provider, model: config.model }
+  }
+  // dsh-acp does not depend on @deepseek-ai/dsh-agent-default-model, so the
+  // service is read strictly and tolerantly: naming it in `inject` would make
+  // Cordis wait for a service this package does not require.
+  const defaults = ctx.get('agentDefaultModel')
+  if (defaults === undefined) return undefined
+  try {
+    const fallback = defaults.currentSelection()
+    return fallback.provider.length === 0 || fallback.model.length === 0 ? undefined : fallback
+  } catch (_unavailableDefaultModel) {
+    return undefined
+  }
+}
+
+/**
+ * [pieqi-fork] Route a caller named in the request `_meta` (B2/B3), using the
+ * ACP extension point rather than a protocol field.
+ *
+ * Two equivalent encodings:
+ * `{ "model": "[\"provider\",\"model\"]" }` reuses the opaque selector value a
+ * client already holds; `{ "provider": ..., "model": ... }` is easier to write
+ * by hand. Both accept `"reasoningEffort"`, applied by session/new only.
+ *
+ * Unrecognized metadata returns undefined rather than failing: `_meta` is
+ * shared by every ACP participant, so unknown content must not break a request.
+ * @param meta - the request `_meta` extension point.
+ * @returns the parsed route, or undefined when the request names none.
+ */
+function requestSelection(meta: RequestMeta): ModelSelection | undefined {
+  if (meta === undefined || meta === null || typeof meta !== 'object') return undefined
+  const raw = meta.model
+  if (typeof raw !== 'string' || raw.length === 0) return undefined
+  const effort = typeof meta.reasoningEffort === 'string' && meta.reasoningEffort.length > 0
+    ? { reasoningEffort: ReasoningEffortId(meta.reasoningEffort) }
+    : {}
+  if (typeof meta.provider === 'string' && meta.provider.length > 0) {
+    return { provider: meta.provider, model: raw, ...effort }
+  }
+  try {
+    const decoded: unknown = JSON.parse(raw)
+    if (
+      Array.isArray(decoded)
+      && decoded.length === 2
+      && typeof decoded[0] === 'string' && decoded[0].length > 0
+      && typeof decoded[1] === 'string' && decoded[1].length > 0
+    ) {
+      return { provider: decoded[0], model: decoded[1], ...effort }
+    }
+  } catch (_invalidSelectionMetadata) {
+    // Not a selector value; the caller named no route.
+  }
+  return undefined
+}
+
+/**
+ * [pieqi-fork] Attach the real configuration state to a response `_meta` (A3).
+ * An empty catalog contributes no key, matching "nothing was advertised".
+ * @param options - the real configuration options.
+ * @returns an object to spread into the response.
+ */
+function catalogMeta(options: readonly SessionConfigOption[]): { _meta?: Record<string, unknown> } {
+  return options.length === 0 ? {} : { _meta: { [CONFIG_OPTIONS_META_KEY]: options } }
 }
 
 interface SessionListCursor {
